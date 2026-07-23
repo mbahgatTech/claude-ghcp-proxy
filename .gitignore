@@ -1,0 +1,5 @@
+.venv/
+config.yaml
+local.settings.json
+*.tmp
+*.log
