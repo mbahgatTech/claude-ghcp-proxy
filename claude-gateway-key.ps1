@@ -6,6 +6,8 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $settings = Get-ProxySettings
 $startScript = Join-Path $root 'start.ps1'
 $logDirectory = Join-Path $env:LOCALAPPDATA 'litellm-copilot-proxy\logs'
+$setupScript = Join-Path $root 'setup.cmd'
+$lifecycleMutex = $null
 
 function Test-LiteLLM {
     try {
@@ -16,38 +18,55 @@ function Test-LiteLLM {
 
         return @($response.data).Count -gt 0
     }
-    catch [System.Net.WebException] {
+    catch {
         return $false
     }
 }
 
-if (-not (Test-LiteLLM)) {
-    if (-not (Test-Path -LiteralPath $startScript)) {
-        throw "LiteLLM startup script was not found at $startScript."
-    }
+try {
+    $lifecycleMutex = Enter-ProxyMutex -Kind Lifecycle -Root $root
 
-    New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
-    $startArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$startScript`""
+    # Recheck after acquiring the mutex because another Claude process may have
+    # started LiteLLM while this process was waiting.
+    if (-not (Test-LiteLLM)) {
+        if (-not (Test-Path -LiteralPath $startScript)) {
+            throw "LiteLLM startup script was not found at $startScript."
+        }
 
-    Start-Process `
-        -FilePath 'powershell.exe' `
-        -ArgumentList $startArguments `
-        -WindowStyle Hidden `
-        -RedirectStandardOutput (Join-Path $logDirectory 'proxy.out.log') `
-        -RedirectStandardError (Join-Path $logDirectory 'proxy.err.log') | Out-Null
+        $listeners = @(Get-NetTCPConnection `
+            -LocalPort $settings.Port `
+            -State Listen `
+            -ErrorAction SilentlyContinue)
+        if ($listeners.Count -gt 0) {
+            throw "Port $($settings.Port) is already in use and the configured LiteLLM proxy is not responding. Stop the process using it, or rerun `"$setupScript`" with a free port (for example: -Port 4567), then restart Claude Code."
+        }
 
-    $ready = $false
-    for ($attempt = 0; $attempt -lt 120; $attempt++) {
-        Start-Sleep -Milliseconds 250
-        if (Test-LiteLLM) {
-            $ready = $true
-            break
+        New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
+        $startArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$startScript`""
+
+        Start-Process `
+            -FilePath 'powershell.exe' `
+            -ArgumentList $startArguments `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput (Join-Path $logDirectory 'proxy.out.log') `
+            -RedirectStandardError (Join-Path $logDirectory 'proxy.err.log') | Out-Null
+
+        $ready = $false
+        for ($attempt = 0; $attempt -lt 120; $attempt++) {
+            Start-Sleep -Milliseconds 250
+            if (Test-LiteLLM) {
+                $ready = $true
+                break
+            }
+        }
+
+        if (-not $ready) {
+            throw "LiteLLM did not become ready at $($settings.BaseUrl). See $logDirectory. If the port is occupied, rerun `"$setupScript`" with a free -Port value and restart Claude Code."
         }
     }
 
-    if (-not $ready) {
-        throw "LiteLLM did not become ready at $($settings.BaseUrl). See $logDirectory."
-    }
+    Write-Output $settings.MasterKey
 }
-
-Write-Output $settings.MasterKey
+finally {
+    Exit-ProxyMutex -Mutex $lifecycleMutex
+}
