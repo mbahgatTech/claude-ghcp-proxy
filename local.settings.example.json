@@ -1,6 +1,4 @@
 {
   "port": 4000,
-  "masterKey": "generated-by-setup",
-  "configureClaude": true,
-  "configureCodex": true
+  "masterKey": "generated-by-setup"
 }

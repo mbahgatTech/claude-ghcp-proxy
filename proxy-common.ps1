@@ -19,7 +19,6 @@ function Get-ProxyMutexName {
     }
 
     $hash = -join ($hashBytes | ForEach-Object { $_.ToString('x2') })
-    # Keep the original prefix so upgrades coordinate with already-running helpers.
     return "Local\ClaudeGhcpProxy-$hash-$Kind"
 }
 
@@ -94,16 +93,11 @@ function Get-ProxySettings {
         throw "Local settings at $Path do not define masterKey."
     }
 
-    $configureClaudeProperty = $settings.PSObject.Properties['configureClaude']
-    $configureCodexProperty = $settings.PSObject.Properties['configureCodex']
-
     return [pscustomobject]@{
         Port = $port
         MasterKey = [string]$masterKeyProperty.Value
         BaseUrl = "http://127.0.0.1:$port"
         Path = $Path
-        ConfigureClaude = if ($configureClaudeProperty) { [bool]$configureClaudeProperty.Value } else { $true }
-        ConfigureCodex = if ($configureCodexProperty) { [bool]$configureCodexProperty.Value } else { $false }
     }
 }
 

@@ -15,14 +15,7 @@ $env:LITELLM_MASTER_KEY = $settings.MasterKey
 $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
 
-$syncArguments = @{}
-if (-not $settings.ConfigureClaude) {
-    $syncArguments.SkipClaudeCache = $true
-}
-if (-not $settings.ConfigureCodex) {
-    $syncArguments.SkipCodexCatalog = $true
-}
-& "$root\sync-models.ps1" @syncArguments
+& "$root\sync-models.ps1"
 
 & $litellm `
     --config $config `
