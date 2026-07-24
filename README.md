@@ -248,7 +248,7 @@ Only model inference is redirected through LiteLLM. Claude Code may still make n
 
 Routing Claude Code to non-Claude models is technically supported by LiteLLM but is not an Anthropic-supported Claude Code scenario. Claude-specific request fields or new Claude Code features may require updated LiteLLM translation support.
 
-Claude Code only discovers gateway model IDs beginning with `claude` or `anthropic`. This repository gives non-Anthropic models aliases such as `claude-gpt-5.6-sol` while retaining their original direct routes.
+Claude Code only discovers gateway model IDs beginning with `claude` or `anthropic`. This repository gives non-Anthropic models router aliases such as `claude-gpt-5.6-sol` while retaining one original deployment per upstream model. Claude models containing dots also receive hidden, dash-normalized compatibility aliases such as `claude-opus-4-8` for subagents. Original model IDs are registered first, and duplicate deployment, alias, and picker IDs are suppressed.
 
 Claude Code also has an open issue where gateway discovery can run before `apiKeyHelper` finishes. The sync script writes `%USERPROFILE%\.claude\cache\gateway-models.json` directly so the picker remains populated.
 

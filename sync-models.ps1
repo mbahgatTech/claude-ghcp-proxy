@@ -89,16 +89,40 @@ function ConvertTo-YamlScalar {
 function Add-ModelRoute {
     param(
         [System.Collections.Generic.List[string]]$Lines,
+        [System.Collections.Generic.HashSet[string]]$PublicNames,
         [string]$PublicName,
         [string]$CopilotModel,
         [string]$Mode
     )
+
+    if (-not $PublicNames.Add($PublicName)) {
+        return
+    }
 
     $Lines.Add("  - model_name: $(ConvertTo-YamlScalar $PublicName)")
     $Lines.Add('    litellm_params:')
     $Lines.Add("      model: $(ConvertTo-YamlScalar "github_copilot/$CopilotModel")")
     $Lines.Add('    model_info:')
     $Lines.Add("      mode: $(ConvertTo-YamlScalar $Mode)")
+}
+
+function Add-ModelAlias {
+    param(
+        [System.Collections.Specialized.OrderedDictionary]$Aliases,
+        [System.Collections.Generic.HashSet[string]]$PublicNames,
+        [string]$PublicName,
+        [string]$TargetModel,
+        [bool]$Hidden = $false
+    )
+
+    if (-not $PublicNames.Add($PublicName)) {
+        return
+    }
+
+    $Aliases.Add($PublicName, [ordered]@{
+        model = $TargetModel
+        hidden = $Hidden
+    })
 }
 
 $apiKey = Get-CopilotApiKey
@@ -130,7 +154,20 @@ if ($models.Count -eq 0) {
 
 $lines = [System.Collections.Generic.List[string]]::new()
 $lines.Add('model_list:')
+$publicNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+$aliases = [ordered]@{}
 $pickerModels = [System.Collections.Generic.List[object]]::new()
+$pickerModelIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+
+# Register upstream IDs first so generated aliases can never shadow a real model.
+foreach ($model in $models) {
+    Add-ModelRoute `
+        -Lines $lines `
+        -PublicNames $publicNames `
+        -PublicName $model.id `
+        -CopilotModel $model.id `
+        -Mode (Get-ModelMode $model)
+}
 
 $families = [ordered]@{
     sonnet = 'claude-sonnet-'
@@ -145,29 +182,34 @@ foreach ($family in $families.GetEnumerator()) {
         Select-Object -First 1
 
     if ($candidate) {
-        Add-ModelRoute `
-            -Lines $lines `
+        Add-ModelAlias `
+            -Aliases $aliases `
+            -PublicNames $publicNames `
             -PublicName $family.Key `
-            -CopilotModel $candidate.id `
-            -Mode (Get-ModelMode $candidate)
+            -TargetModel $candidate.id
     }
 }
 
 foreach ($model in $models) {
-    Add-ModelRoute `
-        -Lines $lines `
-        -PublicName $model.id `
-        -CopilotModel $model.id `
-        -Mode (Get-ModelMode $model)
-
     $pickerModelId = $model.id
-    if ($model.id -notlike 'claude-*') {
+    if ($model.id -like 'claude-*') {
+        $compatibilityModelId = $model.id.Replace('.', '-')
+        if ($compatibilityModelId -cne $model.id) {
+            Add-ModelAlias `
+                -Aliases $aliases `
+                -PublicNames $publicNames `
+                -PublicName $compatibilityModelId `
+                -TargetModel $model.id `
+                -Hidden $true
+        }
+    }
+    else {
         $pickerModelId = "claude-$($model.id)"
-        Add-ModelRoute `
-            -Lines $lines `
+        Add-ModelAlias `
+            -Aliases $aliases `
+            -PublicNames $publicNames `
             -PublicName $pickerModelId `
-            -CopilotModel $model.id `
-            -Mode (Get-ModelMode $model)
+            -TargetModel $model.id
     }
 
     $nameProperty = $model.PSObject.Properties['name']
@@ -178,10 +220,23 @@ foreach ($model in $models) {
         [string]$model.id
     }
 
-    $pickerModels.Add([ordered]@{
-        id = $pickerModelId
-        display_name = $displayName
-    })
+    if ($pickerModelIds.Add($pickerModelId)) {
+        $pickerModels.Add([ordered]@{
+            id = $pickerModelId
+            display_name = $displayName
+        })
+    }
+}
+
+if ($aliases.Count -gt 0) {
+    $lines.Add('')
+    $lines.Add('router_settings:')
+    $lines.Add('  model_group_alias:')
+    foreach ($alias in $aliases.GetEnumerator()) {
+        $lines.Add("    $(ConvertTo-YamlScalar $alias.Key):")
+        $lines.Add("      model: $(ConvertTo-YamlScalar $alias.Value.model)")
+        $lines.Add("      hidden: $(([string]$alias.Value.hidden).ToLowerInvariant())")
+    }
 }
 
 $lines.Add('')
