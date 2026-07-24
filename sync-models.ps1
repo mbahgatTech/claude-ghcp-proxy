@@ -1,3 +1,9 @@
+[CmdletBinding()]
+param(
+    [switch]$SkipClaudeCache,
+    [switch]$SkipCodexCatalog
+)
+
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -10,6 +16,7 @@ $accessTokenPath = Join-Path $tokenDirectory 'access-token'
 $apiKeyPath = Join-Path $tokenDirectory 'api-key.json'
 $claudeGatewayBaseUrl = $settings.BaseUrl
 $claudeModelCachePath = Join-Path $HOME '.claude\cache\gateway-models.json'
+$codexModelCatalogPath = Join-Path $root 'codex-models.json'
 
 $githubHeaders = @{
     Accept = 'application/json'
@@ -89,16 +96,147 @@ function ConvertTo-YamlScalar {
 function Add-ModelRoute {
     param(
         [System.Collections.Generic.List[string]]$Lines,
+        [System.Collections.Generic.HashSet[string]]$PublicNames,
         [string]$PublicName,
         [string]$CopilotModel,
         [string]$Mode
     )
+
+    if (-not $PublicNames.Add($PublicName)) {
+        return
+    }
 
     $Lines.Add("  - model_name: $(ConvertTo-YamlScalar $PublicName)")
     $Lines.Add('    litellm_params:')
     $Lines.Add("      model: $(ConvertTo-YamlScalar "github_copilot/$CopilotModel")")
     $Lines.Add('    model_info:')
     $Lines.Add("      mode: $(ConvertTo-YamlScalar $Mode)")
+}
+
+function Add-ModelAlias {
+    param(
+        [System.Collections.Specialized.OrderedDictionary]$Aliases,
+        [System.Collections.Generic.HashSet[string]]$PublicNames,
+        [string]$PublicName,
+        [string]$TargetModel,
+        [bool]$Hidden = $false
+    )
+
+    if (-not $PublicNames.Add($PublicName)) {
+        return
+    }
+
+    $Aliases.Add($PublicName, [ordered]@{
+        model = $TargetModel
+        hidden = $Hidden
+    })
+}
+
+function Get-CodexDefaultModel {
+    param([object[]]$Models)
+
+    $codexModel = $Models |
+        Where-Object { $_.id -like 'gpt-*-codex*' -and $_.supported_endpoints -contains '/responses' } |
+        Sort-Object @{ Expression = { Get-VersionSortKey $_.id }; Descending = $true } |
+        Select-Object -First 1
+    if ($codexModel) {
+        return [string]$codexModel.id
+    }
+
+    $gptModel = $Models |
+        Where-Object { $_.id -like 'gpt-*' -and $_.supported_endpoints -contains '/responses' } |
+        Sort-Object @{ Expression = { Get-VersionSortKey $_.id }; Descending = $true } |
+        Select-Object -First 1
+    if ($gptModel) {
+        return [string]$gptModel.id
+    }
+
+    $responseModel = $Models |
+        Where-Object { $_.supported_endpoints -contains '/responses' } |
+        Select-Object -First 1
+    if ($responseModel) {
+        return [string]$responseModel.id
+    }
+
+    return [string]$Models[0].id
+}
+
+function ConvertTo-CodexModelInfo {
+    param(
+        $Model,
+        [int]$Priority
+    )
+
+    $supportsProperty = $Model.capabilities.PSObject.Properties['supports']
+    $supports = if ($supportsProperty) { $supportsProperty.Value } else { $null }
+    $limitsProperty = $Model.capabilities.PSObject.Properties['limits']
+    $limits = if ($limitsProperty) { $limitsProperty.Value } else { $null }
+
+    $reasoningLevels = @()
+    if ($supports -and $supports.PSObject.Properties['reasoning_effort']) {
+        $reasoningLevels = @($supports.reasoning_effort | ForEach-Object {
+            [ordered]@{
+                effort = [string]$_
+                description = "$($_) reasoning effort"
+            }
+        })
+    }
+
+    $defaultReasoning = $null
+    foreach ($candidate in @('medium', 'low', 'none')) {
+        if (@($reasoningLevels.effort) -contains $candidate) {
+            $defaultReasoning = $candidate
+            break
+        }
+    }
+
+    $contextWindow = $null
+    if ($limits) {
+        if ($limits.PSObject.Properties['max_prompt_tokens']) {
+            $contextWindow = [long]$limits.max_prompt_tokens
+        }
+        elseif ($limits.PSObject.Properties['max_context_window_tokens']) {
+            $contextWindow = [long]$limits.max_context_window_tokens
+        }
+    }
+
+    $vision = $false
+    $parallelTools = $false
+    if ($supports) {
+        if ($supports.PSObject.Properties['vision']) { $vision = [bool]$supports.vision }
+        if ($supports.PSObject.Properties['parallel_tool_calls']) { $parallelTools = [bool]$supports.parallel_tool_calls }
+    }
+
+    $nameProperty = $Model.PSObject.Properties['name']
+    $displayName = if ($nameProperty -and $nameProperty.Value) { [string]$nameProperty.Value } else { [string]$Model.id }
+
+    return [ordered]@{
+        slug = [string]$Model.id
+        display_name = $displayName
+        description = "GitHub Copilot model $displayName via LiteLLM"
+        default_reasoning_level = $defaultReasoning
+        supported_reasoning_levels = $reasoningLevels
+        shell_type = 'shell_command'
+        visibility = 'list'
+        supported_in_api = $true
+        priority = $Priority
+        availability_nux = $null
+        upgrade = $null
+        base_instructions = ''
+        support_verbosity = $false
+        default_verbosity = $null
+        apply_patch_tool_type = $null
+        truncation_policy = [ordered]@{
+            mode = 'tokens'
+            limit = 10000
+        }
+        supports_parallel_tool_calls = $parallelTools
+        supports_image_detail_original = $false
+        context_window = $contextWindow
+        max_context_window = $contextWindow
+        experimental_supported_tools = @()
+        input_modalities = @(if ($vision) { 'text'; 'image' } else { 'text' })
+    }
 }
 
 $apiKey = Get-CopilotApiKey
@@ -130,7 +268,20 @@ if ($models.Count -eq 0) {
 
 $lines = [System.Collections.Generic.List[string]]::new()
 $lines.Add('model_list:')
+$publicNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+$aliases = [ordered]@{}
 $pickerModels = [System.Collections.Generic.List[object]]::new()
+$pickerModelIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+
+# Register upstream IDs first so generated aliases can never shadow a real model.
+foreach ($model in $models) {
+    Add-ModelRoute `
+        -Lines $lines `
+        -PublicNames $publicNames `
+        -PublicName $model.id `
+        -CopilotModel $model.id `
+        -Mode (Get-ModelMode $model)
+}
 
 $families = [ordered]@{
     sonnet = 'claude-sonnet-'
@@ -145,29 +296,34 @@ foreach ($family in $families.GetEnumerator()) {
         Select-Object -First 1
 
     if ($candidate) {
-        Add-ModelRoute `
-            -Lines $lines `
+        Add-ModelAlias `
+            -Aliases $aliases `
+            -PublicNames $publicNames `
             -PublicName $family.Key `
-            -CopilotModel $candidate.id `
-            -Mode (Get-ModelMode $candidate)
+            -TargetModel $candidate.id
     }
 }
 
 foreach ($model in $models) {
-    Add-ModelRoute `
-        -Lines $lines `
-        -PublicName $model.id `
-        -CopilotModel $model.id `
-        -Mode (Get-ModelMode $model)
-
     $pickerModelId = $model.id
-    if ($model.id -notlike 'claude-*') {
+    if ($model.id -like 'claude-*') {
+        $compatibilityModelId = $model.id.Replace('.', '-')
+        if ($compatibilityModelId -cne $model.id) {
+            Add-ModelAlias `
+                -Aliases $aliases `
+                -PublicNames $publicNames `
+                -PublicName $compatibilityModelId `
+                -TargetModel $model.id `
+                -Hidden $true
+        }
+    }
+    else {
         $pickerModelId = "claude-$($model.id)"
-        Add-ModelRoute `
-            -Lines $lines `
+        Add-ModelAlias `
+            -Aliases $aliases `
+            -PublicNames $publicNames `
             -PublicName $pickerModelId `
-            -CopilotModel $model.id `
-            -Mode (Get-ModelMode $model)
+            -TargetModel $model.id
     }
 
     $nameProperty = $model.PSObject.Properties['name']
@@ -178,10 +334,23 @@ foreach ($model in $models) {
         [string]$model.id
     }
 
-    $pickerModels.Add([ordered]@{
-        id = $pickerModelId
-        display_name = $displayName
-    })
+    if ($pickerModelIds.Add($pickerModelId)) {
+        $pickerModels.Add([ordered]@{
+            id = $pickerModelId
+            display_name = $displayName
+        })
+    }
+}
+
+if ($aliases.Count -gt 0) {
+    $lines.Add('')
+    $lines.Add('router_settings:')
+    $lines.Add('  model_group_alias:')
+    foreach ($alias in $aliases.GetEnumerator()) {
+        $lines.Add("    $(ConvertTo-YamlScalar $alias.Key):")
+        $lines.Add("      model: $(ConvertTo-YamlScalar $alias.Value.model)")
+        $lines.Add("      hidden: $(([string]$alias.Value.hidden).ToLowerInvariant())")
+    }
 }
 
 $lines.Add('')
@@ -190,13 +359,42 @@ $lines.Add('  master_key: os.environ/LITELLM_MASTER_KEY')
 
 Write-Utf8LinesAtomic -Path $configPath -Lines $lines
 
-$claudeModelCache = [ordered]@{
-    baseUrl = $claudeGatewayBaseUrl
-    fetchedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    models = @($pickerModels)
+if (-not $SkipClaudeCache) {
+    $claudeModelCache = [ordered]@{
+        baseUrl = $claudeGatewayBaseUrl
+        fetchedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        models = @($pickerModels)
+    }
+    Write-Utf8NoBomAtomic `
+        -Path $claudeModelCachePath `
+        -Content ($claudeModelCache | ConvertTo-Json -Depth 10 -Compress)
 }
-Write-Utf8NoBomAtomic `
-    -Path $claudeModelCachePath `
-    -Content ($claudeModelCache | ConvertTo-Json -Depth 10 -Compress)
 
-Write-Output "Configured $($models.Count) GitHub Copilot chat models and refreshed Claude's picker cache."
+$defaultCodexModel = $null
+if (-not $SkipCodexCatalog) {
+    $codexModels = @($models | Where-Object { $_.supported_endpoints -contains '/responses' })
+    if ($codexModels.Count -eq 0) {
+        throw 'GitHub Copilot returned no models that support the Responses API required by Codex.'
+    }
+
+    $defaultCodexModel = Get-CodexDefaultModel -Models $codexModels
+    $orderedCodexModels = @(
+        $codexModels |
+            Sort-Object `
+                @{ Expression = { if ($_.id -eq $defaultCodexModel) { 0 } else { 1 } }; Ascending = $true }, `
+                @{ Expression = { $_.id }; Ascending = $true }
+    )
+    $codexCatalogModels = for ($index = 0; $index -lt $orderedCodexModels.Count; $index++) {
+        ConvertTo-CodexModelInfo -Model $orderedCodexModels[$index] -Priority $index
+    }
+    $codexCatalog = [ordered]@{
+        models = @($codexCatalogModels)
+    }
+    Write-Utf8NoBomAtomic `
+        -Path $codexModelCatalogPath `
+        -Content ($codexCatalog | ConvertTo-Json -Depth 20 -Compress)
+}
+
+$cacheMessage = if ($SkipClaudeCache) { '' } else { " and refreshed Claude's picker cache" }
+$catalogMessage = if ($SkipCodexCatalog) { '' } else { " and generated Codex's model catalog (default: $defaultCodexModel)" }
+Write-Output "Configured $($models.Count) GitHub Copilot chat models$cacheMessage$catalogMessage."

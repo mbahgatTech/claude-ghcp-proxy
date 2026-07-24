@@ -12,6 +12,12 @@ param(
 
     [switch]$SkipClaudeInstall,
 
+    [switch]$SkipCodexInstall,
+
+    [switch]$ClaudeOnly,
+
+    [switch]$CodexOnly,
+
     [switch]$NoStart
 )
 
@@ -21,6 +27,13 @@ if (-not $IsWindows -and $PSVersionTable.PSEdition -eq 'Core') {
     throw 'This installer currently supports native Windows only.'
 }
 
+if ($ClaudeOnly -and $CodexOnly) {
+    throw 'Choose either -ClaudeOnly or -CodexOnly, not both.'
+}
+
+$configureClaude = -not $CodexOnly
+$configureCodex = -not $ClaudeOnly
+
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $root 'proxy-common.ps1')
 
@@ -29,8 +42,10 @@ try {
 $localSettingsPath = Join-Path $root 'local.settings.json'
 $venvPath = Join-Path $root '.venv'
 $venvPython = Join-Path $venvPath 'Scripts\python.exe'
-$helperPath = Join-Path $root 'claude-gateway-key.ps1'
+$helperPath = Join-Path $root 'gateway-key.ps1'
 $claudeSettingsPath = Join-Path $env:USERPROFILE '.claude\settings.json'
+$codexSettingsPath = Join-Path $env:USERPROFILE '.codex\config.toml'
+$codexCatalogPath = Join-Path $root 'codex-models.json'
 $accessTokenPath = Join-Path $env:USERPROFILE '.config\litellm\github_copilot\access-token'
 
 function Set-JsonProperty {
@@ -197,6 +212,8 @@ if ([string]::IsNullOrWhiteSpace($MasterKey)) {
 $localSettings = [ordered]@{
     port = $Port
     masterKey = $MasterKey
+    configureClaude = $configureClaude
+    configureCodex = $configureCodex
 }
 Write-Utf8NoBomAtomic `
     -Path $localSettingsPath `
@@ -231,16 +248,46 @@ if ($LASTEXITCODE -ne 0) {
     throw "uv failed to install LiteLLM $LiteLLMVersion with exit code $LASTEXITCODE."
 }
 
-if (-not $SkipClaudeInstall -and -not (Get-Command claude -ErrorAction SilentlyContinue)) {
+if ($configureClaude -and -not $SkipClaudeInstall -and -not (Get-Command claude -ErrorAction SilentlyContinue)) {
     Install-WingetPackage -PackageId 'Anthropic.ClaudeCode'
+}
+
+if ($configureCodex -and -not $SkipCodexInstall -and -not (Get-Command codex -ErrorAction SilentlyContinue)) {
+    Install-WingetPackage -PackageId 'OpenAI.Codex'
 }
 
 if ($ForceAuthentication -or -not (Test-Path -LiteralPath $accessTokenPath)) {
     & (Join-Path $root 'authenticate.ps1')
 }
 
-Merge-ClaudeSettings
-& (Join-Path $root 'sync-models.ps1')
+if ($configureClaude) {
+    Merge-ClaudeSettings
+}
+
+$syncArguments = @{}
+if (-not $configureClaude) {
+    $syncArguments.SkipClaudeCache = $true
+}
+if (-not $configureCodex) {
+    $syncArguments.SkipCodexCatalog = $true
+}
+$syncResult = & (Join-Path $root 'sync-models.ps1') @syncArguments
+$syncResult | Write-Output
+
+if ($configureCodex) {
+    $catalog = Get-Content -LiteralPath $codexCatalogPath -Raw | ConvertFrom-Json
+    $defaultModel = [string]$catalog.models[0].slug
+    if ([string]::IsNullOrWhiteSpace($defaultModel)) {
+        throw "The generated Codex model catalog at $codexCatalogPath does not contain a default model."
+    }
+
+    & (Join-Path $root 'configure-codex.ps1') `
+        -Path $codexSettingsPath `
+        -BaseUrl "http://127.0.0.1:$Port/v1" `
+        -DefaultModel $defaultModel `
+        -ModelCatalogPath $codexCatalogPath `
+        -HelperPath $helperPath
+}
 
 if (-not $NoStart) {
     $null = & $helperPath
@@ -257,8 +304,14 @@ if (-not $NoStart) {
 Write-Output ''
 Write-Output 'Setup complete.'
 Write-Output "LiteLLM: http://127.0.0.1:$Port"
-Write-Output 'Run Claude Code with: claude'
-Write-Output 'Open the model picker with: /model'
+if ($configureClaude) {
+    Write-Output 'Run Claude Code with: claude'
+    Write-Output 'Open the Claude model picker with: /model'
+}
+if ($configureCodex) {
+    Write-Output 'Run Codex with: codex'
+    Write-Output 'Open the Codex model picker with: /model'
+}
 }
 finally {
     Exit-ProxyMutex -Mutex $setupMutex

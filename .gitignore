@@ -1,5 +1,7 @@
 .venv/
+.claude/
 config.yaml
 local.settings.json
+codex-models.json
 *.tmp
 *.log
