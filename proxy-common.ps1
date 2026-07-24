@@ -1,3 +1,72 @@
+function Get-ProxyMutexName {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Setup', 'Lifecycle')]
+        [string]$Kind,
+
+        [string]$Root = $PSScriptRoot
+    )
+
+    $normalizedRoot = [System.IO.Path]::GetFullPath($Root).ToUpperInvariant()
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hashBytes = $sha256.ComputeHash(
+            [System.Text.Encoding]::UTF8.GetBytes($normalizedRoot)
+        )
+    }
+    finally {
+        $sha256.Dispose()
+    }
+
+    $hash = -join ($hashBytes | ForEach-Object { $_.ToString('x2') })
+    return "Local\ClaudeGhcpProxy-$hash-$Kind"
+}
+
+function Enter-ProxyMutex {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Setup', 'Lifecycle')]
+        [string]$Kind,
+
+        [string]$Root = $PSScriptRoot
+    )
+
+    $mutex = New-Object System.Threading.Mutex(
+        $false,
+        (Get-ProxyMutexName -Kind $Kind -Root $Root)
+    )
+
+    try {
+        try {
+            $null = $mutex.WaitOne()
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            # The previous owner exited without releasing it; this process owns it now.
+        }
+
+        return $mutex
+    }
+    catch {
+        $mutex.Dispose()
+        throw
+    }
+}
+
+function Exit-ProxyMutex {
+    param($Mutex)
+
+    if (-not $Mutex) {
+        return
+    }
+
+    try {
+        $Mutex.ReleaseMutex()
+    }
+    finally {
+        $Mutex.Dispose()
+    }
+}
+
 function Get-ProxySettings {
     param(
         [string]$Path = (Join-Path $PSScriptRoot 'local.settings.json')

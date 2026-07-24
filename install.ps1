@@ -24,6 +24,8 @@ if (-not $IsWindows -and $PSVersionTable.PSEdition -eq 'Core') {
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $root 'proxy-common.ps1')
 
+$setupMutex = Enter-ProxyMutex -Kind Setup -Root $root
+try {
 $localSettingsPath = Join-Path $root 'local.settings.json'
 $venvPath = Join-Path $root '.venv'
 $venvPython = Join-Path $venvPath 'Scripts\python.exe'
@@ -115,7 +117,7 @@ function Stop-InstalledProxy {
     $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($connection.OwningProcess)"
     $normalizedRoot = [System.IO.Path]::GetFullPath($root)
     if (-not $process.CommandLine -or $process.CommandLine.IndexOf($normalizedRoot, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
-        throw "Port $Port is already used by an unrelated process: $($process.CommandLine)"
+        throw "Port $Port is already used by an unrelated process. Stop that process or rerun setup with a free port, for example: .\setup.cmd -Port 4567"
     }
 
     Stop-Process -Id $connection.OwningProcess -Force
@@ -257,3 +259,7 @@ Write-Output 'Setup complete.'
 Write-Output "LiteLLM: http://127.0.0.1:$Port"
 Write-Output 'Run Claude Code with: claude'
 Write-Output 'Open the model picker with: /model'
+}
+finally {
+    Exit-ProxyMutex -Mutex $setupMutex
+}
