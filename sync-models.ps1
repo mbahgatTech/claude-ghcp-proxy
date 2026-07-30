@@ -20,9 +20,17 @@ $githubHeaders = @{
 }
 
 function Get-CopilotApiKey {
-    if (Test-Path -LiteralPath $apiKeyPath) {
+    param(
+        [switch]$ForceRefresh
+    )
+
+    # Refresh a few minutes early; server-side expiry can reject tokens still
+    # inside a tight local skew window (seen as 401 "IDE token expired").
+    $expirySkewSeconds = 300
+
+    if (-not $ForceRefresh -and (Test-Path -LiteralPath $apiKeyPath)) {
         $cached = Get-Content -LiteralPath $apiKeyPath -Raw | ConvertFrom-Json
-        $minimumExpiry = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 60
+        $minimumExpiry = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + $expirySkewSeconds
         if ($cached.token -and $cached.endpoints.api -and [long]$cached.expires_at -gt $minimumExpiry) {
             return $cached
         }
@@ -39,10 +47,19 @@ function Get-CopilotApiKey {
 
     $headers = $githubHeaders.Clone()
     $headers.Authorization = "token $accessToken"
-    $apiKey = Invoke-RestMethod `
-        -Method Get `
-        -Uri 'https://api.github.com/copilot_internal/v2/token' `
-        -Headers $headers
+    try {
+        $apiKey = Invoke-RestMethod `
+            -Method Get `
+            -Uri 'https://api.github.com/copilot_internal/v2/token' `
+            -Headers $headers
+    }
+    catch {
+        $detail = $_.Exception.Message
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $detail = $_.ErrorDetails.Message
+        }
+        throw "Failed to refresh the GitHub Copilot API token ($detail). Re-run $root\authenticate.ps1 if the OAuth session expired."
+    }
 
     if (-not $apiKey.token -or -not $apiKey.endpoints.api) {
         throw 'GitHub Copilot returned an invalid API key response.'
@@ -53,6 +70,29 @@ function Get-CopilotApiKey {
         -Content ($apiKey | ConvertTo-Json -Depth 20 -Compress)
 
     return $apiKey
+}
+
+function Get-CopilotModels {
+    param($ApiKey)
+
+    $copilotHeaders = $githubHeaders.Clone()
+    $copilotHeaders.Authorization = "Bearer $($ApiKey.token)"
+    $copilotHeaders['Copilot-Integration-Id'] = 'vscode-chat'
+    $copilotHeaders['X-GitHub-Api-Version'] = '2025-04-01'
+
+    $apiBase = $ApiKey.endpoints.api.TrimEnd('/')
+    return Invoke-RestMethod -Method Get -Uri "$apiBase/models" -Headers $copilotHeaders
+}
+
+function Test-CopilotAuthFailure {
+    param($ErrorRecord)
+
+    $parts = @(
+        [string]$ErrorRecord.Exception.Message
+        if ($ErrorRecord.ErrorDetails) { [string]$ErrorRecord.ErrorDetails.Message }
+    ) -join ' '
+
+    return $parts -match '(?i)unauthorized|forbidden|token expired|401|403'
 }
 
 function Get-ModelMode {
@@ -126,13 +166,28 @@ function Add-ModelAlias {
 }
 
 $apiKey = Get-CopilotApiKey
-$copilotHeaders = $githubHeaders.Clone()
-$copilotHeaders.Authorization = "Bearer $($apiKey.token)"
-$copilotHeaders['Copilot-Integration-Id'] = 'vscode-chat'
-$copilotHeaders['X-GitHub-Api-Version'] = '2025-04-01'
+try {
+    $response = Get-CopilotModels -ApiKey $apiKey
+}
+catch {
+    if (-not (Test-CopilotAuthFailure -ErrorRecord $_)) {
+        throw
+    }
 
-$apiBase = $apiKey.endpoints.api.TrimEnd('/')
-$response = Invoke-RestMethod -Method Get -Uri "$apiBase/models" -Headers $copilotHeaders
+    # Cached short-lived IDE token can be rejected before local expires_at.
+    $apiKey = Get-CopilotApiKey -ForceRefresh
+    try {
+        $response = Get-CopilotModels -ApiKey $apiKey
+    }
+    catch {
+        $detail = $_.Exception.Message
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $detail = $_.ErrorDetails.Message
+        }
+        throw "GitHub Copilot model discovery failed after token refresh ($detail). Re-run $root\authenticate.ps1, then .\setup.cmd."
+    }
+}
+
 $models = @($response.data | Where-Object {
     $policyProperty = $_.PSObject.Properties['policy']
     $policyState = $null
